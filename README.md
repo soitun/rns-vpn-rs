@@ -4,6 +4,18 @@
 
 Library and application for VPN client over Reticulum mesh network.
 
+## Quick Start
+
+```bash
+# Clone the repository and checkout the holochain branch
+git clone https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs.git
+cd rns-vpn-rs
+git checkout holochain
+
+# Build the project
+cargo build --release
+```
+
 ## Building
 
 Building `Reticulum-rs` requires `protoc` binary for compiling `.proto` files.
@@ -62,3 +74,18 @@ $ ncat -u 10.0.0.1 12345
 foo
 foo
 ```
+
+## Documentation
+
+This repository includes comprehensive documentation for different use cases:
+
+- **[POC_SETUP_GUIDE.md](POC_SETUP_GUIDE.md)** - Complete proof of concept setup guide
+- **[TEAM_QUESTIONS_ANSWERS.md](TEAM_QUESTIONS_ANSWERS.md)** - Answers to common setup questions
+- **[HOLOCHAIN_SETUP.md](HOLOCHAIN_SETUP.md)** - Holochain integration guide
+- **[TEST_RESULTS.md](TEST_RESULTS.md)** - Test results and verification
+
+## Repository Information
+
+- **Repository**: https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs
+- **Branch**: `holochain` (contains all setup scripts and documentation)
+- **Main branch**: `master` (basic VPN functionality)

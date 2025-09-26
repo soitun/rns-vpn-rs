@@ -5,6 +5,9 @@ set -x
 
 echo "Setting up Node 2 (10.0.0.2) for Holochain over RNS-VPN-RS"
 
+# Ensure we're on the holochain branch
+git checkout holochain
+
 # Build the project
 cargo build --release
 
