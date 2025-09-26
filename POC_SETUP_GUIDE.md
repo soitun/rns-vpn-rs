@@ -11,8 +11,9 @@ This guide addresses the specific questions about setting up a working PoC for t
 #### Step 1: Prepare Both Machines
 ```bash
 # On both machines, clone and build
-git clone <your-repo>
+git clone https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs.git
 cd rns-vpn-rs
+git checkout holochain
 cargo build --release
 ```
 
