@@ -38,8 +38,9 @@ Node A (10.0.0.1)                    Node B (10.0.0.2)
 ### On Node 1 (10.0.0.1):
 ```bash
 # Clone and setup
-git clone <your-repo>
+git clone https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs.git
 cd rns-vpn-rs
+git checkout holochain
 ./setup-node1.sh
 
 # Start RNS-VPN-RS (replace <NODE2_IP> with actual IP)
@@ -52,8 +53,9 @@ sudo -E target/release/rns-vpn -p 4242 -f <NODE2_IP>:4243
 ### On Node 2 (10.0.0.2):
 ```bash
 # Clone and setup
-git clone <your-repo>
+git clone https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs.git
 cd rns-vpn-rs
+git checkout holochain
 ./setup-node2.sh
 
 # Start RNS-VPN-RS (replace <NODE1_IP> with actual IP)
