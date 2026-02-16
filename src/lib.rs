@@ -196,6 +196,7 @@ impl Client {
                 }
               }
             }
+            LinkEvent::Proof(_) => {}
           }
           Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
             log::debug!("recv in link event lagged: {n}");
