@@ -1,13 +1,13 @@
 //! Reticulum VPN client
 
 use std::{fs, process};
+use std::sync::Arc;
 
 use clap::Parser;
 use ed25519_dalek;
 use env_logger;
 use log;
 use pem;
-use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::kaonic::kaonic_grpc::KaonicGrpc;
 use reticulum::iface::kaonic::RadioConfig;
@@ -108,7 +108,7 @@ async fn main() -> Result<(), process::ExitCode> {
     };
     PrivateIdentity::new(private_key, sign_key)
   };
-  let mut transport = Transport::new(TransportConfig::new("server", &id, true));
+  let transport = Transport::new(TransportConfig::new("server", &id, true));
   if let Some (port) = cmd.udp_listen_port {
     // udp
     let forward = cmd.udp_forward_address.unwrap();
@@ -128,17 +128,12 @@ async fn main() -> Result<(), process::ExitCode> {
     let _ = transport.iface_manager().lock().await.spawn(
       KaonicGrpc::new(address, radio_config, None), KaonicGrpc::spawn);
   }
-  // create in destination
-  let in_destination = transport
-    .add_destination(id, DestinationName::new("rns_vpn", "client")).await;
-  let in_destination_hash = in_destination.lock().await.desc.address_hash;
-  log::info!("created destination: {}",
-    format!("{}", in_destination_hash).trim_matches('/'));
-  // client
-  let client = match rns_vpn::Client::new(config.vpn_config, in_destination).await {
+  let transport = Arc::new(tokio::sync::Mutex::new(transport));
+  // run
+  let client = match rns_vpn::Client::run(config.vpn_config, transport, id).await {
     Ok(client) => client,
     Err(err) => match err {
-      rns_vpn::CreateClientError::RiptunError(riptun::Error::Unix {
+      rns_vpn::ClientError::RiptunError(riptun::Error::Unix {
         source: nix::errno::Errno::EPERM
       }) => {
         log::error!("EPERM error creating TUN interface: \
@@ -146,13 +141,12 @@ async fn main() -> Result<(), process::ExitCode> {
         return Err(process::ExitCode::FAILURE)
       }
       _ => {
-        log::error!("error creating VPN client: {:?}", err);
+        log::error!("error running VPN client: {:?}", err);
         return Err(process::ExitCode::FAILURE)
       }
     }
   };
-  // run
-  client.run(transport).await;
-  log::info!("server exit");
+  client.await_finished().await;
+  log::info!("client exit");
   Ok(())
 }

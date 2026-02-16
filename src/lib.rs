@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use tokio;
 use tokio::sync::Mutex;
 
-use reticulum::destination::SingleInputDestination;
+use reticulum::destination::{DestinationName, SingleInputDestination};
 use reticulum::destination::link::{LinkEvent, LinkId};
 use reticulum::hash::AddressHash;
+use reticulum::identity::PrivateIdentity;
 use reticulum::transport::Transport;
 
 // TODO: config?
@@ -34,11 +35,13 @@ pub struct Config {
 pub struct Client {
   config: Config,
   in_destination: Arc<Mutex<SingleInputDestination>>,
-  tun: Tun
+  peer_map: Arc<Mutex<BTreeMap<IpAddr, Peer>>>,
+  tun: Arc<Tun>,
+  run_handle: Option<tokio::task::JoinHandle<()>>
 }
 
 #[derive(Debug)]
-pub enum CreateClientError {
+pub enum ClientError {
   ConfigError(String),
   RiptunError(riptun::Error),
   IpAddBroadcastError(std::io::Error),
@@ -47,6 +50,21 @@ pub enum CreateClientError {
   IptablesError(std::io::Error)
 }
 
+#[derive(Debug)]
+pub enum PeerAddError {
+  /// Attempt to add peer that already exists
+  AlreadyExists,
+  /// Attempted to add a peer that maps to the same IP as an existing peer
+  IpConflicts(AddressHash, IpAddr)
+}
+
+#[derive(Debug)]
+pub enum PeerRemoveError {
+  /// Peer was not found
+  NotFound
+}
+
+#[derive(Clone)]
 struct Peer {
   dest: AddressHash,
   link_id: Option<LinkId>,
@@ -55,60 +73,36 @@ struct Peer {
 
 struct Tun {
   tun: TokioTun,
-  read_buf: tokio::sync::Mutex<[u8; MTU]>
+  read_buf: Mutex<[u8; MTU]>
 }
 
 impl Client {
-  pub async fn new(config: Config, in_destination: Arc<Mutex<SingleInputDestination>>)
-    -> Result<Self, CreateClientError>
+  pub async fn run(config: Config, transport: Arc<Mutex<Transport>>, id: PrivateIdentity)
+    -> Result<Self, ClientError>
   {
-    if config.peers.is_empty() {
-      log::warn!("no peers configured");
-      return Err(CreateClientError::ConfigError(
-          "no peers: add at least one peer destination to configuration".to_string()))
-    }
-    let destination_hash = in_destination.lock().await.desc.address_hash;
-    let vpn_ip = destination_to_ip(destination_hash, config.network);
-    let tun = Tun::new(vpn_ip)?;
-    Ok(Client { config, in_destination, tun })
-  }
-
-  pub async fn run(&self, transport: Transport) {
-    let in_destination_hash = self.in_destination.lock().await.desc.address_hash;
-    // set up peer map
-    let peer_map = {
-      let mut peer_map = BTreeMap::<IpAddr, Peer>::new();
-      for dest in self.config.peers.iter() {
-        let dest = match AddressHash::new_from_hex_string(dest.as_str()) {
-          Ok(dest) => dest,
-          Err(err) => {
-            log::error!("error parsing peer destination hash: {err:?}");
-            return
-          }
-        };
-        let peer = Peer { dest, link_id: None, link_active: false };
-        let ip = destination_to_ip(dest, self.config.network);
-        assert!(peer_map.insert(ip.addr(), peer).is_none());
-      }
-      tokio::sync::Mutex::new(peer_map)
-    };
+    let transport_clone = transport.clone();
+    let mut client = Client::new(config, transport_clone.clone(), id).await?;
+    let in_destination_hash = client.in_destination.lock().await.desc.address_hash;
     // send announces
-    let announce_loop = async || loop {
-      transport.send_announce(&self.in_destination, None).await;
-      tokio::time::sleep(
-        std::time::Duration::from_secs(self.config.announce_freq_secs as u64)
-      ).await;
+    let transport = transport_clone.clone();
+    let announce_freq_secs = client.config.announce_freq_secs as u64;
+    let in_destination = client.in_destination.clone();
+    let announce_loop = async move || loop {
+      transport.lock().await.send_announce(&in_destination, None).await;
+      tokio::time::sleep(std::time::Duration::from_secs(announce_freq_secs)).await;
     };
     // set up links
-    let link_loop = async || {
-      let mut announce_recv = transport.recv_announces().await;
+    let transport = transport_clone.clone();
+    let peer_map = client.peer_map.clone();
+    let link_loop = async move || {
+      let mut announce_recv = transport.lock().await.recv_announces().await;
       while let Ok(announce) = announce_recv.recv().await {
         let destination = announce.destination.lock().await;
         // loop up destination in peers
         for peer in peer_map.lock().await.values_mut() {
           if destination.desc.address_hash == peer.dest {
             if peer.link_id.is_none() {
-              let link = transport.link(destination.desc).await;
+              let link = transport.lock().await.link(destination.desc).await;
               peer.link_id = Some(link.lock().await.id().clone());
               log::debug!("created link {} for peer {}",
                 peer.link_id.as_ref().unwrap(), peer.dest);
@@ -119,8 +113,11 @@ impl Client {
       }
     };
     // tun loop: read data from tun and send on links
-    let tun_loop = async || {
-      while let Ok(bytes) = self.tun.read().await {
+    let transport = transport_clone.clone();
+    let peer_map = client.peer_map.clone();
+    let tun = client.tun.clone();
+    let tun_loop = async move || {
+      while let Ok(bytes) = tun.read().await {
         log::trace!("got tun bytes ({})", bytes.len());
         if let Ok((ip_header, _)) = etherparse::IpHeaders::from_slice(bytes.as_slice())
           .map_err(|e| log::error!("couldn't parse packet from tun: {e:?}"))
@@ -131,17 +128,24 @@ impl Client {
           } else if let Some((ipv6_header, _)) = ip_header.ipv6() {
             destination_ip = Some(IpAddr::from(ipv6_header.destination));
           } else {
-            log::error!("failed to get ipv4 or ipv6 headers from ip header: {:?}", ip_header);
+            log::error!("failed to get ipv4 or ipv6 headers from ip header: {:?}",
+              ip_header);
           }
           if let Some(destination_ip) = destination_ip {
-            if let Some(peer) = peer_map.lock().await.get(&destination_ip) {
+            let peer_map_guard = peer_map.lock().await;
+            if let Some(peer) = peer_map_guard.get(&destination_ip).cloned() {
+              drop(peer_map_guard);
               if let Some(link_id) = peer.link_id.as_ref() {
-                if let Some(link) = transport.find_out_link(&peer.dest).await {
+                let transport_guard = transport.lock().await;
+                if let Some(link) = transport_guard.find_out_link(&peer.dest).await
+                  .clone()
+                {
+                  drop(transport_guard);
                   log::trace!("sending to {} on link {}", peer.dest, link_id);
                   let link = link.lock().await;
                   let packet = link.data_packet(&bytes).unwrap();
                   drop(link);
-                  transport.send_packet(packet).await;
+                  transport.lock().await.send_packet(packet).await;
                 } else {
                   log::warn!("could not get link {} for peer {}", link_id, peer.dest);
                 }
@@ -152,14 +156,18 @@ impl Client {
       }
     };
     // upstream link data: put link data into tun
-    let upstream_loop = async || {
-      let mut in_link_events = transport.in_link_events();
+    let transport = transport_clone.clone();
+    let peer_map = client.peer_map.clone();
+    let tun = client.tun.clone();
+    let upstream_loop = async move || {
+      let peer_map = peer_map.clone();
+      let mut in_link_events = transport.lock().await.in_link_events();
       loop {
         match in_link_events.recv().await {
           Ok(link_event) => match link_event.event {
             LinkEvent::Data(payload) => if link_event.address_hash == in_destination_hash {
               log::trace!("link {} payload ({})", link_event.id, payload.len());
-              match self.tun.send(payload.as_slice()).await {
+              match tun.send(payload.as_slice()).await {
                 Ok(n) => log::trace!("tun sent {n} bytes"),
                 Err(err) => {
                   log::error!("tun error sending bytes: {err:?}");
@@ -197,22 +205,87 @@ impl Client {
         }
       }
     };
-    tokio::select!{
-      _ = announce_loop() => log::info!("announce loop exited: shutting down"),
-      _ = link_loop() => log::info!("link loop exited: shutting down"),
-      _ = tun_loop() => log::info!("tun loop exited: shutting down"),
-      _ = upstream_loop() => log::info!("upstream loop exited: shutting down"),
-      _ = tokio::signal::ctrl_c() => log::info!("got ctrl-c: shutting down")
+    let run_handle = tokio::spawn(async move {
+      tokio::select!{
+        _ = announce_loop() => log::info!("announce loop exited: shutting down"),
+        _ = link_loop() => log::info!("link loop exited: shutting down"),
+        _ = tun_loop() => log::info!("tun loop exited: shutting down"),
+        _ = upstream_loop() => log::info!("upstream loop exited: shutting down"),
+        _ = tokio::signal::ctrl_c() => log::info!("got ctrl-c: shutting down")
+      }
+    });
+    client.run_handle = Some(run_handle);
+    Ok(client)
+  }
+
+  pub fn is_running(&self) -> bool {
+    self.run_handle.as_ref().map(|handle| handle.is_finished()).unwrap_or(false)
+  }
+
+  pub async fn await_finished(mut self) {
+    if let Some(handle) = self.run_handle.take() {
+      let _ = handle.await;
     }
+  }
+
+  async fn new(
+    config: Config, transport: Arc<tokio::sync::Mutex<Transport>>, id: PrivateIdentity
+  ) -> Result<Self, ClientError> {
+    // create in destination
+    let in_destination = transport.lock().await
+      .add_destination(id, DestinationName::new("rns_vpn", "client")).await;
+    let in_destination_hash = in_destination.lock().await.desc.address_hash;
+    log::info!("created destination: {}",
+      format!("{}", in_destination_hash).trim_matches('/'));
+    let local_ip = destination_to_ip(in_destination_hash, config.network);
+    // set up peer map
+    if config.peers.is_empty() {
+      log::warn!("no peers configured");
+    }
+    let peer_map = {
+      let mut peer_map = BTreeMap::<IpAddr, Peer>::new();
+      for dest in config.peers.iter() {
+        let dest = match AddressHash::new_from_hex_string(dest.as_str()) {
+          Ok(dest) => dest,
+          Err(err) => {
+            log::error!("error parsing peer destination hash: {err:?}");
+            return Err(ClientError::ConfigError(
+                format!("error parsing peer destination hash: {err:?}")))
+          }
+        };
+        let peer = Peer { dest, link_id: None, link_active: false };
+        let ip = destination_to_ip(dest, config.network);
+        if ip == local_ip {
+          log::error!("the IP for peer {dest} conflicts with the local IP: {local_ip}");
+          return Err(ClientError::ConfigError(format!(
+            "the IP for peer {dest} conflicts with the local IP: {local_ip}")))
+        }
+        if let Some(existing_peer) = peer_map.insert(ip.addr(), peer) {
+          log::error!(
+            "the configured peer destinations ({}, {}) map to the same IP: {ip}",
+            existing_peer.dest, dest);
+          return Err(ClientError::ConfigError(format!(
+              "the configured peer destinations ({}, {}) map to the same IP: {ip}",
+              existing_peer.dest, dest)))
+        }
+      }
+      Arc::new(Mutex::new(peer_map))
+    };
+    let destination_hash = in_destination.lock().await.desc.address_hash;
+    let vpn_ip = destination_to_ip(destination_hash, config.network);
+    let tun = Arc::new(Tun::new(vpn_ip)?);
+    let run_handle = None;
+    let client = Client { config, in_destination, tun, peer_map, run_handle };
+    Ok(client)
   }
 }
 
 impl Tun {
-  pub fn new(ip: IpNet) -> Result<Self, CreateClientError> {
+  pub fn new(ip: IpNet) -> Result<Self, ClientError> {
     log::debug!("creating tun device");
     let ip: IpNet = ip.into();
     let tun = TokioTun::new("rip%d", TUN_NQUEUES)
-      .map_err(CreateClientError::RiptunError)?;
+      .map_err(ClientError::RiptunError)?;
     log::debug!("created tun device: {}", tun.name());
     log::debug!("adding broadcast ip addr: {}", ip);
     let output = std::process::Command::new("ip")
@@ -224,9 +297,9 @@ impl Tun {
       .arg("dev")
       .arg(tun.name())
       .output()
-      .map_err(CreateClientError::IpAddBroadcastError)?;
+      .map_err(ClientError::IpAddBroadcastError)?;
     if !output.status.success() {
-      return Err(CreateClientError::IpAddBroadcastError(
+      return Err(ClientError::IpAddBroadcastError(
         std::io::Error::other(format!("ip addr add command failed ({:?})",
           output.status.code())).into()));
     }
@@ -238,9 +311,9 @@ impl Tun {
       .arg(tun.name())
       .arg("up")
       .output()
-      .map_err(CreateClientError::IpLinkUpError)?;
+      .map_err(ClientError::IpLinkUpError)?;
     if !output.status.success() {
-      return Err(CreateClientError::IpLinkUpError(
+      return Err(ClientError::IpLinkUpError(
         std::io::Error::other(format!("ip link set command failed ({:?})",
           output.status.code()))))
     }
