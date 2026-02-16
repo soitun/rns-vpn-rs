@@ -23,6 +23,8 @@ toml = "0.8.*"
 x25519-dalek = "2.*"
 
 [dependencies.reticulum]
-git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs"
-#path = "../../remote/Reticulum-rs"
+#git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs"
+git = "https://github.com/spearman/Reticulum-rs"
+branch = "get-destinations"
+#path = "../Reticulum-rs"
 version = "0.1.*"

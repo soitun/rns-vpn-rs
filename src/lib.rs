@@ -34,6 +34,7 @@ pub struct Config {
 
 pub struct Client {
   config: Config,
+  transport: Arc<Mutex<Transport>>,
   in_destination: Arc<Mutex<SingleInputDestination>>,
   peer_map: Arc<Mutex<BTreeMap<IpAddr, Peer>>>,
   tun: Arc<Tun>,
@@ -77,6 +78,7 @@ struct Tun {
 }
 
 impl Client {
+  /// Initialize and run client on background tasks
   pub async fn run(config: Config, transport: Arc<Mutex<Transport>>, id: PrivateIdentity)
     -> Result<Self, ClientError>
   {
@@ -218,14 +220,105 @@ impl Client {
     Ok(client)
   }
 
+  /// Check if the client task is still running
   pub fn is_running(&self) -> bool {
     self.run_handle.as_ref().map(|handle| handle.is_finished()).unwrap_or(false)
   }
 
+  /// Blocks until the running task exits. This will run forever unless a task exits
+  /// unexpectedly.
   pub async fn await_finished(mut self) {
     if let Some(handle) = self.run_handle.take() {
       let _ = handle.await;
     }
+  }
+
+  /// Add peer
+  pub async fn peer_add(&self, destination: AddressHash) -> Result<(), PeerAddError> {
+    let ip = destination_to_ip(destination, self.config.network).addr();
+    let in_destination = self.in_destination.lock().await.desc.address_hash;
+    let local_ip = destination_to_ip(in_destination, self.config.network).addr();
+    if ip == local_ip {
+      log::warn!("the IP for peer {destination} conflicts with the local IP: {local_ip}");
+      return Err(PeerAddError::IpConflicts(in_destination, ip))
+    }
+    let peer_map = self.peer_map.lock().await;
+    if let Some(existing_peer) = peer_map.get(&ip) {
+      if existing_peer.dest == destination {
+        log::warn!("peer add ({destination}): already exists");
+        return Err(PeerAddError::AlreadyExists)
+      } else {
+        log::warn!("peer add ({destination}): ip {ip} conflicts with peer {}",
+          existing_peer.dest);
+        return Err(PeerAddError::IpConflicts(existing_peer.dest, ip))
+      }
+    }
+    drop(peer_map);
+    log::debug!("adding peer {destination}");
+    let mut peer = Peer { dest: destination, link_id: None, link_active: false };
+    let transport = self.transport.lock().await;
+    if let Some(dest) = transport.get_out_destination(&destination).await {
+      let link = transport.link(dest.lock().await.desc).await;
+      drop(transport);
+      peer.link_id = Some(link.lock().await.id().clone());
+      log::debug!("created link {} for peer {}",
+        peer.link_id.as_ref().unwrap(), peer.dest);
+    }
+    let res = self.peer_map.lock().await.insert(ip, peer);
+    debug_assert!(res.is_none());
+    Ok(())
+  }
+
+  /// Remove peer and close link
+  pub async fn peer_remove(&self, destination: AddressHash)
+    -> Result<(), PeerRemoveError>
+  {
+    let mut peer_map = self.peer_map.lock().await;
+    let ip = destination_to_ip(destination, self.config.network).addr();
+    if let Some(peer) = peer_map.get(&ip) {
+      if peer.dest != destination {
+        Err(PeerRemoveError::NotFound)
+      } else {
+        // safe to unwrap: we checked with get(&ip) above
+        let peer = peer_map.remove(&ip).unwrap();
+        drop(peer_map);
+        if let Some(link_id) = peer.link_id {
+          let transport = self.transport.lock().await;
+          if let Some(link) = transport.find_out_link(&peer.dest).await.clone() {
+            drop(transport);
+            log::debug!("closing link {link_id} for peer {}", peer.dest);
+            link.lock().await.close();
+          }
+        }
+        log::debug!("removed peer {destination}");
+        Ok(())
+      }
+    } else {
+      if cfg!(debug_assertions) {
+        // sanity check that the destination doesn't exist under any other ips
+        for peer in peer_map.values() {
+          debug_assert_ne!(peer.dest, destination);
+        }
+      }
+      Err(PeerRemoveError::NotFound)
+    }
+  }
+
+  /// Remove all peers and close links
+  pub async fn clear_peers(&self) {
+    let mut peer_map = self.peer_map.lock().await;
+    for peer in peer_map.values() {
+      if let Some(link_id) = peer.link_id {
+        let transport = self.transport.lock().await;
+        if let Some(link) = transport.find_out_link(&peer.dest).await.clone() {
+          drop(transport);
+          log::debug!("closing link {link_id} for peer {}", peer.dest);
+          link.lock().await.close();
+        }
+      }
+    }
+    peer_map.clear();
+    log::debug!("peer map cleared");
   }
 
   async fn new(
@@ -275,7 +368,7 @@ impl Client {
     let vpn_ip = destination_to_ip(destination_hash, config.network);
     let tun = Arc::new(Tun::new(vpn_ip)?);
     let run_handle = None;
-    let client = Client { config, in_destination, tun, peer_map, run_handle };
+    let client = Client { config, transport, in_destination, tun, peer_map, run_handle };
     Ok(client)
   }
 }
