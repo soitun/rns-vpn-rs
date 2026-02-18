@@ -2,11 +2,13 @@
 
 > P2P VPN over Reticulum mesh network
 
-Library and application for VPN client over Reticulum mesh network.
+Library and client application for VPN client over Reticulum mesh network.
 
 ## Building
 
 Building `Reticulum-rs` requires `protoc` binary for compiling `.proto` files.
+
+Client application is a workspace member, build or run with `-p rns-vpn-client` flag.
 
 ## Client configuration
 
@@ -19,8 +21,10 @@ the network
 
 ## Client application
 
-Client application uses a Reticulum UDP interface that is configured with command-line
-arguments.
+`rns-vpn-client`
+
+Client application uses a Reticulum UDP or Kaonic interface that is configured with
+command-line arguments. See `--help` for all options.
 
 Private keys can be generated with `openssl` tool using the `genkeys.sh` script.
 
@@ -29,9 +33,13 @@ configured private keys and should be provided to peers to add to their configur
 
 Command-line options:
 
-`-p <port>` -- required: local UDP port for Reticulum interface
+`-p <port>` -- local UDP port for Reticulum interface; required unless using Kaonic
+option
 
-`-f <ip>:<port>` -- required: IP and port for upstream Reticulum node
+`-f <ip>:<port>` -- IP and port for upstream Reticulum node; required unless using
+Kaonic option
+
+`-a <grpc-address>` -- Kaonic gRPC address; required unless using UDP options
 
 `[-i <name>]` -- optional: use string to generate private ID; overrides
 creation of identity with `RNS_VPN_PRIVKEY_PATH`/`RNS_VPN_SIGNKEY_PATH` variables
